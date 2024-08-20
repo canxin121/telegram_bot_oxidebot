@@ -1,0 +1,25 @@
+[package]
+name = "telegram_bot_oxidebot"
+version = "0.1.0"
+edition = "2021"
+description = "Telegram Bot for oxidebot framework"
+license = "MIT OR Apache-2.0"
+authors = ["canxin121 <q1969730106@gmail.com>"]
+homepage = "https://github.com/canxin121/telegram_bot_oxidebot"
+repository = "https://github.com/canxin121/telegram_bot_oxidebot"
+readme = "Readme.md"
+keywords = ["bot", "chatbot", "oxidebot"]
+categories = [
+    "science::robotics",
+    "api-bindings",
+]
+
+
+[dependencies]
+anyhow = "1.0.86"
+chrono = { version = "0.4.38", features = ["now"] }
+hyper = "1.4.1"
+oxidebot = "0.1.1"
+telegram_bot_api_rs = "0.1.0"
+tokio = { version = "1.39.3", features = ["full"] }
+tracing = "0.1.40"
