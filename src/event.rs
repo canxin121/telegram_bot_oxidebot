@@ -9,10 +9,10 @@ use oxidebot::{
             GroupMemberMuteChangeEvent, MessageEditedEvent, MessageReactionsEvent,
         },
         request::GroupAddEvent,
-        Event, MessageEvent,
+        Event, EventObject, MessageEvent,
     },
     source::message::Message,
-    EventObject, EventTrait,
+    EventTrait,
 };
 use telegram_bot_api_rs::{
     available_types::{
@@ -47,7 +47,7 @@ impl EventTrait for UpdateEvent {
         SERVER
     }
 
-    fn clone_box(&self) -> oxidebot::EventObject {
+    fn clone_box(&self) -> EventObject {
         Box::new(UpdateEvent(self.0.clone()))
     }
 
@@ -340,7 +340,10 @@ pub fn parse_update(update: UpdateData) -> Vec<Event> {
                         },
                         message: {
                             Message {
-                                id: format!("{}_{}", message_reaction.chat.id, message_reaction.message_id),
+                                id: format!(
+                                    "{}_{}",
+                                    message_reaction.chat.id, message_reaction.message_id
+                                ),
                                 segments: Vec::with_capacity(0),
                             }
                         },

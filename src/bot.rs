@@ -1,8 +1,8 @@
 use std::{any::Any, sync::Arc};
 
-use oxidebot::{matcher::Matcher, source::bot::BotInfo, BotObject, BotTrait};
+use oxidebot::{bot::BotObject, matcher::Matcher, source::bot::BotInfo, BotTrait};
 use telegram_bot_api_rs::getting_updates::GetUpdateConfig;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use crate::{event::UpdateEvent, SERVER};
 
@@ -55,7 +55,7 @@ impl BotTrait for TelegramBot {
     #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
     fn start_sending_events<'life0, 'async_trait>(
         &'life0 self,
-        sender: mpsc::Sender<Matcher>,
+        sender: broadcast::Sender<Matcher>,
     ) -> ::core::pin::Pin<
         Box<dyn ::core::future::Future<Output = ()> + ::core::marker::Send + 'async_trait>,
     >
@@ -71,7 +71,7 @@ impl BotTrait for TelegramBot {
                     Ok(update) => {
                         let matchers = Matcher::new(UpdateEvent::new(update), self.clone_box());
                         for matcher in matchers {
-                            sender.send(matcher).await.unwrap();
+                            sender.send(matcher).unwrap();
                         }
                     }
                     Err(e) => {

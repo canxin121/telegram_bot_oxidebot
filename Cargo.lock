@@ -34,9 +34,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.86"
+version = "1.0.87"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+checksum = "10f00e1f6e58a40e807377c75c6a7f97bf9044fab57816f2414e6f5f4499d7b8"
 
 [[package]]
 name = "async-trait"
@@ -498,9 +498,9 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
 name = "oxidebot"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e0d3ab864cf919192eb3eb58c8484b387206a9cd1f657b8822fb989f12b1116"
+checksum = "016a6b2f8bc13670fdb778f3957b97edbae92e6a0dacc6cd0e86d7bfc7b2b9c2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "telegram_bot_oxidebot"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
