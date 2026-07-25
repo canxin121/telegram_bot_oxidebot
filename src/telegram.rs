@@ -8,9 +8,11 @@
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use reqwest::multipart::{Form, Part};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::Sha256;
 
 pub const BOT_API_VERSION: &str = "10.2";
 
@@ -148,10 +150,96 @@ impl TelegramClient {
         self.call("getMe", &EmptyPayload {}).await
     }
 
+    /// Verifies Telegram Mini App initialization data with the bot-token HMAC.
+    /// `max_age` rejects otherwise valid replayed payloads when supplied.
+    pub fn verify_web_app_init_data(
+        &self,
+        init_data: &str,
+        max_age: Option<Duration>,
+    ) -> Result<Map<String, Value>> {
+        let mut fields = url::form_urlencoded::parse(init_data.as_bytes())
+            .into_owned()
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            fields.iter().filter(|(name, _)| name == "hash").count() == 1,
+            "Telegram Mini App init data must contain exactly one hash"
+        );
+        let hash_index = fields
+            .iter()
+            .position(|(name, _)| name == "hash")
+            .context("Telegram Mini App init data has no hash")?;
+        let (_, hash) = fields.remove(hash_index);
+        fields.retain(|(name, _)| name != "signature");
+        fields.sort_by(|left, right| left.0.cmp(&right.0));
+        anyhow::ensure!(
+            fields.windows(2).all(|fields| fields[0].0 != fields[1].0),
+            "Telegram Mini App init data contains duplicate fields"
+        );
+        let data_check_string = fields
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut secret =
+            Hmac::<Sha256>::new_from_slice(b"WebAppData").expect("HMAC accepts keys of any length");
+        secret.update(self.token.as_bytes());
+        let secret = secret.finalize().into_bytes();
+        let expected = decode_hex(&hash).context("invalid Telegram Mini App hash")?;
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&secret).expect("HMAC accepts keys of any length");
+        mac.update(data_check_string.as_bytes());
+        mac.verify_slice(&expected)
+            .map_err(|_| anyhow::anyhow!("invalid Telegram Mini App signature"))?;
+
+        let mut result = Map::new();
+        for (name, value) in fields {
+            let value = if matches!(name.as_str(), "user" | "receiver" | "chat") {
+                serde_json::from_str(&value)
+                    .with_context(|| format!("invalid Telegram Mini App {name} JSON"))?
+            } else if matches!(name.as_str(), "auth_date" | "can_send_after") {
+                value
+                    .parse::<i64>()
+                    .map(Value::from)
+                    .unwrap_or(Value::String(value))
+            } else {
+                Value::String(value)
+            };
+            result.insert(name, value);
+        }
+        result.insert("hash".to_owned(), hash.into());
+
+        if let Some(max_age) = max_age {
+            let auth_date = result
+                .get("auth_date")
+                .and_then(Value::as_i64)
+                .context("Telegram Mini App init data has no valid auth_date")?;
+            let age = chrono::Utc::now().timestamp().saturating_sub(auth_date);
+            anyhow::ensure!(age >= 0, "Telegram Mini App auth_date is in the future");
+            anyhow::ensure!(
+                u64::try_from(age).unwrap_or(u64::MAX) <= max_age.as_secs(),
+                "Telegram Mini App init data has expired"
+            );
+        }
+        Ok(result)
+    }
+
     pub async fn get_file(&self, file_id: &str) -> Result<TelegramFile> {
         self.call("getFile", &serde_json::json!({ "file_id": file_id }))
             .await
     }
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(value.len().is_multiple_of(2), "hex value has odd length");
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("hex input is UTF-8");
+            u8::from_str_radix(pair, 16).with_context(|| format!("invalid hex byte {pair:?}"))
+        })
+        .collect()
 }
 
 fn validate_method(method: &str) -> Result<()> {
@@ -486,6 +574,22 @@ pub struct MessageReactionUpdated {
     pub new_reaction: Vec<ReactionType>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub from: User,
+    #[serde(default)]
+    pub message: Option<Message>,
+    #[serde(default)]
+    pub inline_message_id: Option<String>,
+    #[serde(default)]
+    pub chat_instance: String,
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default)]
+    pub game_short_name: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReactionType {
     #[serde(rename = "type")]
@@ -509,7 +613,7 @@ pub struct ChatMemberUpdated {
     pub via_chat_folder_invite_link: Option<bool>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ChatMember {
     pub status: String,
     pub user: User,
@@ -521,6 +625,10 @@ pub struct ChatMember {
     pub until_date: Option<i64>,
     #[serde(default)]
     pub custom_title: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl ChatMember {
@@ -549,6 +657,8 @@ pub struct ChatJoinRequest {
     pub user_chat_id: i64,
     #[serde(default)]
     pub bio: Option<String>,
+    #[serde(default)]
+    pub date: i64,
     #[serde(default)]
     pub query_id: Option<String>,
 }
@@ -645,5 +755,36 @@ mod tests {
 
         assert!(error.to_string().contains("migrated to chat -1001"));
         assert!(error.to_string().contains("retry after 5s"));
+    }
+
+    #[test]
+    fn mini_app_init_data_is_authenticated_and_decoded() {
+        let token = "123:test-secret";
+        let user = r#"{"id":42,"first_name":"User","is_bot":false}"#;
+        let check = format!("auth_date=1700000000\nquery_id=query-1\nuser={user}");
+        let mut secret = Hmac::<Sha256>::new_from_slice(b"WebAppData").unwrap();
+        secret.update(token.as_bytes());
+        let secret = secret.finalize().into_bytes();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
+        mac.update(check.as_bytes());
+        let hash = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let init_data = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("query_id", "query-1")
+            .append_pair("user", user)
+            .append_pair("auth_date", "1700000000")
+            .append_pair("hash", &hash)
+            .finish();
+        let client = TelegramClient::with_api_base(token, "http://localhost").unwrap();
+        let verified = client.verify_web_app_init_data(&init_data, None).unwrap();
+        assert_eq!(verified["user"]["id"], 42);
+        assert_eq!(verified["auth_date"], 1_700_000_000_i64);
+
+        let tampered = init_data.replace("query-1", "query-2");
+        assert!(client.verify_web_app_init_data(&tampered, None).is_err());
     }
 }
