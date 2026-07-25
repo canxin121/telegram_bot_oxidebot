@@ -1,85 +1,129 @@
-use std::{any::Any, sync::Arc};
+use std::{any::Any, sync::Arc, time::Duration};
 
+use anyhow::{Context as _, Result};
 use oxidebot::{bot::BotObject, matcher::Matcher, source::bot::BotInfo, BotTrait};
-use telegram_bot_api_rs::getting_updates::GetUpdateConfig;
 use tokio::sync::broadcast;
 
-use crate::{event::UpdateEvent, SERVER};
+use crate::{
+    event::UpdateEvent,
+    telegram::{GetUpdatesConfig, TelegramApiError, TelegramClient},
+    utils::telegram_user_name,
+    SERVER,
+};
 
 #[derive(Debug, Clone)]
 pub struct TelegramBot {
-    pub bot: Arc<telegram_bot_api_rs::bot::Bot>,
-    pub bot_info: Arc<BotInfo>,
-    pub config: GetUpdateConfig,
+    client: Arc<TelegramClient>,
+    bot_info: Arc<BotInfo>,
+    config: GetUpdatesConfig,
 }
 
 impl TelegramBot {
-    pub async fn new(token: String, config: GetUpdateConfig) -> BotObject {
-        let bot = telegram_bot_api_rs::bot::Bot::new(token);
-        let bot_info = bot.get_me().await.unwrap();
+    /// Backwards-compatible constructor.
+    ///
+    /// New code should prefer [`Self::try_new`] so invalid credentials or a
+    /// network error can be handled without a panic.
+    #[allow(clippy::new_ret_no_self)] // Kept for the crate's 0.1 API compatibility.
+    pub async fn new(token: String, config: GetUpdatesConfig) -> BotObject {
+        Self::try_new(token, config).await.expect(
+            "failed to initialize Telegram bot; use TelegramBot::try_new to handle this error",
+        )
+    }
+
+    pub async fn try_new(token: impl Into<String>, config: GetUpdatesConfig) -> Result<BotObject> {
+        let client = TelegramClient::new(token)?;
+        Self::try_from_client(client, config).await
+    }
+
+    /// Creates a bot using a local or test Bot API server.
+    pub async fn try_with_api_base(
+        token: impl Into<String>,
+        api_base: impl Into<String>,
+        config: GetUpdatesConfig,
+    ) -> Result<BotObject> {
+        let client = TelegramClient::with_api_base(token, api_base)?;
+        Self::try_from_client(client, config).await
+    }
+
+    async fn try_from_client(
+        client: TelegramClient,
+        config: GetUpdatesConfig,
+    ) -> Result<BotObject> {
+        anyhow::ensure!(
+            (1..=100).contains(&config.limit),
+            "Telegram getUpdates limit must be between 1 and 100"
+        );
+        let me = client
+            .get_me()
+            .await
+            .context("Telegram getMe failed while initializing the bot")?;
         let bot_info = BotInfo {
-            id: Some(bot_info.id.to_string()),
-            nickname: Some(bot_info.username.unwrap_or_else(|| {
-                format!(
-                    "{}{}",
-                    bot_info.first_name,
-                    bot_info.last_name.unwrap_or("".to_string())
-                )
-            })),
+            id: Some(me.id.to_string()),
+            nickname: Some(telegram_user_name(&me)),
         };
-        tracing::info!("Connection succeed: {:?}", bot_info);
-        Box::new(Self {
-            bot: bot.into(),
-            bot_info: bot_info.into(),
-            config: config,
-        })
+        tracing::info!(bot = ?bot_info, api_version = crate::telegram::BOT_API_VERSION, "connected to Telegram");
+        Ok(Box::new(Self {
+            client: Arc::new(client),
+            bot_info: Arc::new(bot_info),
+            config,
+        }))
+    }
+
+    /// Returns the low-level, token-redacting client for Telegram-specific
+    /// methods that do not have an oxidebot-wide abstraction.
+    pub fn client(&self) -> &TelegramClient {
+        &self.client
     }
 }
 
+#[async_trait::async_trait]
 impl BotTrait for TelegramBot {
-    #[must_use]
-    #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
-    fn bot_info<'life0, 'async_trait>(
-        &'life0 self,
-    ) -> ::core::pin::Pin<
-        Box<dyn ::core::future::Future<Output = BotInfo> + ::core::marker::Send + 'async_trait>,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(async move { self.bot_info.as_ref().clone() })
+    async fn bot_info(&self) -> BotInfo {
+        self.bot_info.as_ref().clone()
     }
 
-    #[must_use]
-    #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
-    fn start_sending_events<'life0, 'async_trait>(
-        &'life0 self,
-        sender: broadcast::Sender<Matcher>,
-    ) -> ::core::pin::Pin<
-        Box<dyn ::core::future::Future<Output = ()> + ::core::marker::Send + 'async_trait>,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        self.bot.start_get_updates(self.config.clone());
-        let mut subscriber = self.bot.subscribe_updates();
-        Box::pin(async move {
-            loop {
-                match subscriber.recv().await {
-                    Ok(update) => {
-                        let matchers = Matcher::new(UpdateEvent::new(update), self.clone_box());
+    async fn start_sending_events(&self, sender: broadcast::Sender<Matcher>) {
+        let mut config = self.config.clone();
+        let mut retry_delay = Duration::from_secs(1);
+
+        loop {
+            match self.client.get_updates(&config).await {
+                Ok(updates) => {
+                    retry_delay = Duration::from_secs(1);
+                    for update in updates {
+                        config.offset = Some(update.update_id.saturating_add(1));
+                        let matchers = Matcher::new(UpdateEvent::boxed(update), self.clone_box());
                         for matcher in matchers {
-                            sender.send(matcher).unwrap();
+                            if sender.send(matcher).is_err() {
+                                tracing::warn!(
+                                    "oxidebot event receiver was dropped; stopping Telegram polling"
+                                );
+                                return;
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Error while receiving update: {:?}", e);
-                    }
+                }
+                Err(error) => {
+                    let telegram_retry_delay = error
+                        .downcast_ref::<TelegramApiError>()
+                        .and_then(|error| error.parameters.as_ref())
+                        .and_then(|parameters| parameters.retry_after)
+                        .map(Duration::from_secs);
+                    let delay = telegram_retry_delay.unwrap_or(retry_delay);
+                    tracing::error!(
+                        error = %error,
+                        retry_in_seconds = delay.as_secs(),
+                        "Telegram getUpdates failed"
+                    );
+                    tokio::time::sleep(delay).await;
+                    retry_delay = if telegram_retry_delay.is_some() {
+                        Duration::from_secs(1)
+                    } else {
+                        retry_delay.saturating_mul(2).min(Duration::from_secs(30))
+                    };
                 }
             }
-        })
+        }
     }
 
     fn server(&self) -> &'static str {

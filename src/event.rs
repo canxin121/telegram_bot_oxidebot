@@ -1,46 +1,42 @@
 use std::time::Duration;
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use oxidebot::{
     event::{
         any::{AnyEvent, AnyEventDataTrait},
         notice::{
-            GroupAdminChangeEvent, GroupAdminChangeType, GroupMemberDecreaseEvent,
-            GroupMemberMuteChangeEvent, MessageEditedEvent, MessageReactionsEvent,
+            GroupAdminChangeEvent, GroupAdminChangeType, GroupMemberAliasChangeEvent,
+            GroupMemberDecreaseEvent, GroupMemberDecreaseReason, GroupMemberIncreseEvent,
+            GroupMemberIncreseReason, GroupMemberMuteChangeEvent, MessageEditedEvent,
+            MessageReactionsEvent, MuteType,
         },
         request::GroupAddEvent,
-        Event, EventObject, MessageEvent,
+        Event, EventObject, MessageEvent, NoticeEvent, RequestEvent,
     },
     source::message::Message,
     EventTrait,
 };
-use telegram_bot_api_rs::{
-    available_types::{
-        BusinessConnection, BusinessMessagesDeleted, ChatBoostRemoved, ChatBoostUpdated,
-        ChatMember, MessageReactionCountUpdated,
-    },
-    getting_updates::types::UpdateData,
-    inline_mode::types::{ChosenInlineResult, InlineQuery},
-    payments::types::{PreCheckoutQuery, ShippingQuery},
-};
+use serde_json::Value;
 
 use crate::{
-    segment::{self, parse_message, parse_reaction},
-    utils::{parse_group, parse_user},
+    segment::{parse_message, parse_reaction},
+    telegram::{ChatMemberUpdated, Message as TelegramMessage, MessageReactionUpdated, Update},
+    utils::{join_request_id, message_id, parse_chat_sender, parse_group, parse_user},
     SERVER,
 };
 
-pub struct UpdateEvent(pub UpdateData);
+#[derive(Clone, Debug)]
+pub struct UpdateEvent(pub Update);
 
 impl UpdateEvent {
-    pub fn new(update: UpdateData) -> EventObject {
-        Box::new(UpdateEvent(update))
+    pub fn boxed(update: Update) -> EventObject {
+        Box::new(Self(update))
     }
 }
 
 impl EventTrait for UpdateEvent {
     fn get_events(&self) -> Vec<Event> {
-        parse_update(self.0.clone())
+        parse_update(&self.0)
     }
 
     fn server(&self) -> &'static str {
@@ -48,7 +44,7 @@ impl EventTrait for UpdateEvent {
     }
 
     fn clone_box(&self) -> EventObject {
-        Box::new(UpdateEvent(self.0.clone()))
+        Box::new(self.clone())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -56,11 +52,19 @@ impl EventTrait for UpdateEvent {
     }
 }
 
-pub struct BussinessConnectionEventWrapper(pub BusinessConnection);
+/// Raw Telegram data for update kinds that do not have an oxidebot-native
+/// event. This is also the compatibility escape hatch for future Bot API
+/// update kinds.
+#[derive(Clone, Debug)]
+pub struct TelegramRawEvent {
+    pub update_id: i64,
+    pub kind: String,
+    pub data: Value,
+}
 
-impl AnyEventDataTrait for BussinessConnectionEventWrapper {
+impl AnyEventDataTrait for TelegramRawEvent {
     fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(BussinessConnectionEventWrapper(self.0.clone()))
+        Box::new(self.clone())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -68,525 +72,437 @@ impl AnyEventDataTrait for BussinessConnectionEventWrapper {
     }
 }
 
-pub struct ChatBoostEventWrapper(pub ChatBoostUpdated);
+pub fn parse_update(update: &Update) -> Vec<Event> {
+    let Some(kind) = update.kind() else {
+        return vec![raw_event(update, "unknown", Value::Null)];
+    };
 
-impl AnyEventDataTrait for ChatBoostEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(ChatBoostEventWrapper(self.0.clone()))
-    }
+    let parsed = match kind {
+        "message" => update
+            .decode::<TelegramMessage>(kind)
+            .map(parse_message_update),
+        "edited_message" => update
+            .decode::<TelegramMessage>(kind)
+            .map(parse_edited_message),
+        "channel_post" => update
+            .decode::<TelegramMessage>(kind)
+            .map(parse_message_update),
+        "edited_channel_post" => update
+            .decode::<TelegramMessage>(kind)
+            .map(parse_edited_message),
+        "message_reaction" => update
+            .decode::<MessageReactionUpdated>(kind)
+            .map(parse_message_reaction),
+        "my_chat_member" | "chat_member" => update
+            .decode::<ChatMemberUpdated>(kind)
+            .map(parse_chat_member_update),
+        "chat_join_request" => {
+            update
+                .decode::<crate::telegram::ChatJoinRequest>(kind)
+                .map(|request| {
+                    vec![Event::RequestEvent(RequestEvent::GroupAddEvent(
+                        GroupAddEvent {
+                            id: join_request_id(request.chat.id, request.from.id),
+                            user: parse_user(request.from),
+                            group: parse_group(request.chat),
+                            message: request.bio,
+                        },
+                    ))]
+                })
+        }
+        _ => {
+            return vec![raw_event(
+                update,
+                kind,
+                update.value().cloned().unwrap_or(Value::Null),
+            )]
+        }
+    };
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-pub struct RemovedChatBoostEventWrapper(pub ChatBoostRemoved);
-impl AnyEventDataTrait for RemovedChatBoostEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(RemovedChatBoostEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-pub struct MessageReactionCountEventWrapper(pub MessageReactionCountUpdated);
-impl AnyEventDataTrait for MessageReactionCountEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(MessageReactionCountEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-pub struct InlineQueryEventWrapper(pub InlineQuery);
-impl AnyEventDataTrait for InlineQueryEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(InlineQueryEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-pub struct ChosenInlineResultEventWrapper(pub ChosenInlineResult);
-impl AnyEventDataTrait for ChosenInlineResultEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(ChosenInlineResultEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-pub struct PreCheckoutQueryEventWrapper(pub PreCheckoutQuery);
-impl AnyEventDataTrait for PreCheckoutQueryEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(PreCheckoutQueryEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-pub struct CallbackQueryEventWrapper(pub telegram_bot_api_rs::available_types::CallbackQuery);
-impl AnyEventDataTrait for CallbackQueryEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(CallbackQueryEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    match parsed {
+        Ok(events) if !events.is_empty() => events,
+        Ok(_) => vec![raw_event(
+            update,
+            kind,
+            update.value().cloned().unwrap_or(Value::Null),
+        )],
+        Err(error) => {
+            tracing::error!(
+                update_id = update.update_id,
+                update_kind = kind,
+                error = %error,
+                "failed to map Telegram update; forwarding it as a raw event"
+            );
+            vec![raw_event(
+                update,
+                kind,
+                update.value().cloned().unwrap_or(Value::Null),
+            )]
+        }
     }
 }
 
-pub struct ShippingQueryEventWrapper(pub ShippingQuery);
-impl AnyEventDataTrait for ShippingQueryEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(ShippingQueryEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+fn raw_event(update: &Update, kind: &str, data: Value) -> Event {
+    Event::AnyEvent(AnyEvent {
+        server: SERVER,
+        r#type: kind.to_owned(),
+        data: Box::new(TelegramRawEvent {
+            update_id: update.update_id,
+            kind: kind.to_owned(),
+            data,
+        }),
+    })
 }
 
-pub struct PollEventWrapper(pub telegram_bot_api_rs::available_types::Poll);
-impl AnyEventDataTrait for PollEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(PollEventWrapper(self.0.clone()))
+fn parse_message_update(message: TelegramMessage) -> Vec<Event> {
+    let mut events = Vec::new();
+
+    let sender = message
+        .from
+        .clone()
+        .map(parse_user)
+        .or_else(|| message.sender_chat.clone().map(parse_chat_sender));
+    let parsed_message = parse_message(message.clone());
+    if !parsed_message.segments.is_empty() {
+        if let Some(sender) = sender {
+            events.push(Event::MessageEvent(MessageEvent {
+                id: message_id(message.chat.id, message.message_id),
+                time: DateTime::from_timestamp(message.date, 0),
+                sender,
+                group: (!is_private(&message)).then(|| parse_group(message.chat.clone())),
+                message: parsed_message,
+            }));
+        }
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    for member in message.new_chat_members.clone().into_iter().flatten() {
+        events.push(Event::NoticeEvent(NoticeEvent::GroupMemberIncreseEvent(
+            GroupMemberIncreseEvent {
+                group: parse_group(message.chat.clone()),
+                user: parse_user(member),
+                reason: GroupMemberIncreseReason::Unknown,
+            },
+        )));
     }
+    if let Some(member) = message.left_chat_member {
+        events.push(Event::NoticeEvent(NoticeEvent::GroupMemberDecreaseEvent(
+            GroupMemberDecreaseEvent {
+                group: parse_group(message.chat),
+                user: parse_user(member),
+                reason: GroupMemberDecreaseReason::Unknown,
+            },
+        )));
+    }
+    events
 }
 
-pub struct PollAnswerEventWrapper(pub telegram_bot_api_rs::available_types::PollAnswer);
+fn parse_edited_message(message: TelegramMessage) -> Vec<Event> {
+    let sender = message
+        .from
+        .clone()
+        .map(parse_user)
+        .or_else(|| message.sender_chat.clone().map(parse_chat_sender));
+    let Some(sender) = sender else {
+        return Vec::new();
+    };
 
-impl AnyEventDataTrait for PollAnswerEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(PollAnswerEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+    vec![Event::NoticeEvent(NoticeEvent::MessageEditedEvent(
+        MessageEditedEvent {
+            user: sender.clone(),
+            group: (!is_private(&message)).then(|| parse_group(message.chat.clone())),
+            new_message: Some(parse_message(message)),
+            operator: Some(sender),
+            old_message: None,
+        },
+    ))]
 }
 
-pub struct DeletedBusinessMessagesEventWrapper(pub BusinessMessagesDeleted);
-impl AnyEventDataTrait for DeletedBusinessMessagesEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(DeletedBusinessMessagesEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+fn is_private(message: &TelegramMessage) -> bool {
+    message.chat.kind == "private"
 }
 
-pub struct EditedBusinessMessageEventWrapper(pub telegram_bot_api_rs::available_types::Message);
+fn parse_message_reaction(reaction: MessageReactionUpdated) -> Vec<Event> {
+    let actor = reaction
+        .user
+        .map(parse_user)
+        .or_else(|| reaction.actor_chat.map(parse_chat_sender));
+    let Some(actor) = actor else {
+        return Vec::new();
+    };
 
-impl AnyEventDataTrait for EditedBusinessMessageEventWrapper {
-    fn clone_box(&self) -> Box<dyn AnyEventDataTrait> {
-        Box::new(EditedBusinessMessageEventWrapper(self.0.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+    vec![Event::NoticeEvent(NoticeEvent::MessageReactionsEvent(
+        MessageReactionsEvent {
+            user: actor,
+            group: (reaction.chat.kind != "private").then(|| parse_group(reaction.chat.clone())),
+            message: Message {
+                id: message_id(reaction.chat.id, reaction.message_id),
+                segments: Vec::new(),
+            },
+            reactions: reaction
+                .new_reaction
+                .into_iter()
+                .map(parse_reaction)
+                .collect(),
+        },
+    ))]
 }
 
-pub fn parse_update(update: UpdateData) -> Vec<Event> {
-    let mut results = Vec::new();
-    match update {
-        UpdateData::Message { message } => {
-            if let Some(user) = message.from.clone().and_then(|f| Some(parse_user(f))) {
-                results.push(Event::MessageEvent(MessageEvent {
-                    id: format!("{}_{}", message.chat.id, message.message_id),
-                    time: DateTime::from_timestamp(message.date, 0),
-                    sender: user,
-                    group: {
-                        if message.chat.r#type == "private" {
-                            None
-                        } else {
-                            Some(parse_group(message.chat.clone()))
-                        }
-                    },
-                    message: segment::parse_message(message.clone()),
-                }));
+fn parse_chat_member_update(update: ChatMemberUpdated) -> Vec<Event> {
+    let mut events = Vec::new();
+    let group = parse_group(update.chat.clone());
+    let actor = parse_user(update.from.clone());
+    let target = parse_user(update.new_chat_member.user.clone());
+    let was_present = update.old_chat_member.is_present();
+    let is_present = update.new_chat_member.is_present();
+
+    if !was_present && is_present {
+        let reason = if update.via_join_request.unwrap_or(false) {
+            GroupMemberIncreseReason::Approve {
+                operator: Some(actor.clone()),
             }
-            if let Some(new_chatmembers) = message.new_chat_members {
-                for new_chatmember in new_chatmembers {
-                    results.push(Event::NoticeEvent(
-                        oxidebot::event::NoticeEvent::GroupMemberIncreseEvent(
-                            oxidebot::event::notice::GroupMemberIncreseEvent {
-                                group: parse_group(message.chat.clone()),
-                                user: parse_user(new_chatmember),
-                                reason: oxidebot::event::notice::GroupMemberIncreseReason::Unknown,
-                            },
-                        ),
-                    ));
+        } else if update.from.id != update.new_chat_member.user.id {
+            GroupMemberIncreseReason::Invite {
+                inviter: Some(actor.clone()),
+                operator: Some(actor.clone()),
+            }
+        } else {
+            GroupMemberIncreseReason::Unknown
+        };
+        events.push(Event::NoticeEvent(NoticeEvent::GroupMemberIncreseEvent(
+            GroupMemberIncreseEvent {
+                group: group.clone(),
+                user: target.clone(),
+                reason,
+            },
+        )));
+    } else if was_present && !is_present {
+        let reason = if update.new_chat_member.status == "kicked" {
+            GroupMemberDecreaseReason::Kick {
+                operator: Some(actor.clone()),
+            }
+        } else if update.from.id == update.new_chat_member.user.id {
+            GroupMemberDecreaseReason::Leave
+        } else {
+            GroupMemberDecreaseReason::Kick {
+                operator: Some(actor.clone()),
+            }
+        };
+        events.push(Event::NoticeEvent(NoticeEvent::GroupMemberDecreaseEvent(
+            GroupMemberDecreaseEvent {
+                group: group.clone(),
+                user: target.clone(),
+                reason,
+            },
+        )));
+    }
+
+    let was_admin = update.old_chat_member.is_admin();
+    let is_admin = update.new_chat_member.is_admin();
+    if was_admin != is_admin {
+        events.push(Event::NoticeEvent(NoticeEvent::GroupAdminChangeEvent(
+            GroupAdminChangeEvent {
+                group: group.clone(),
+                user: target.clone(),
+                r#type: if is_admin {
+                    GroupAdminChangeType::Set
+                } else {
+                    GroupAdminChangeType::Unset
+                },
+            },
+        )));
+    }
+
+    let was_muted = update.old_chat_member.is_muted();
+    let is_muted = update.new_chat_member.is_muted();
+    if was_muted != is_muted {
+        let mute_type = if is_muted {
+            MuteType::Mute {
+                duration: remaining_duration(update.new_chat_member.until_date),
+            }
+        } else {
+            MuteType::UnMute
+        };
+        events.push(Event::NoticeEvent(NoticeEvent::GroupMemberMuteChangeEvent(
+            GroupMemberMuteChangeEvent {
+                group: group.clone(),
+                user: target.clone(),
+                operator: Some(actor.clone()),
+                r#type: mute_type,
+            },
+        )));
+    }
+
+    if update.old_chat_member.custom_title != update.new_chat_member.custom_title {
+        events.push(Event::NoticeEvent(
+            NoticeEvent::GroupMemberAliasChangeEvent(GroupMemberAliasChangeEvent {
+                group,
+                user: target,
+                operator: Some(actor),
+                old_alias: update.old_chat_member.custom_title,
+                new_alias: update.new_chat_member.custom_title,
+            }),
+        ));
+    }
+
+    events
+}
+
+fn remaining_duration(until_date: Option<i64>) -> Option<Duration> {
+    let until_date = until_date.filter(|date| *date > 0)?;
+    let seconds = until_date.saturating_sub(Utc::now().timestamp()).max(0);
+    Some(Duration::from_secs(seconds as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use oxidebot::event::notice::GroupMemberDecreaseReason;
+
+    use super::*;
+
+    fn update(value: Value) -> Update {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn bot_api_10_2_subscription_is_forwarded_raw() {
+        let update = update(serde_json::json!({
+            "update_id": 1,
+            "subscription": {"currency": "XTR"}
+        }));
+        let events = parse_update(&update);
+        let Event::AnyEvent(event) = &events[0] else {
+            panic!("expected raw event")
+        };
+        assert_eq!(event.r#type, "subscription");
+        assert!(event.downcast_ref::<TelegramRawEvent>().is_some());
+    }
+
+    #[test]
+    fn channel_post_uses_sender_chat_instead_of_being_dropped() {
+        let update = update(serde_json::json!({
+            "update_id": 2,
+            "channel_post": {
+                "message_id": 7,
+                "date": 1,
+                "chat": {"id": -100, "type": "channel", "title": "News"},
+                "sender_chat": {"id": -100, "type": "channel", "title": "News"},
+                "text": "hello"
+            }
+        }));
+        let events = parse_update(&update);
+        let Event::MessageEvent(event) = &events[0] else {
+            panic!("expected message event")
+        };
+        assert_eq!(event.sender.id, "-100");
+        assert_eq!(event.message.get_raw_text(), "hello");
+    }
+
+    #[test]
+    fn kicked_member_is_target_not_the_operator() {
+        let update = update(serde_json::json!({
+            "update_id": 3,
+            "chat_member": {
+                "chat": {"id": -100, "type": "supergroup", "title": "Group"},
+                "from": {"id": 1, "is_bot": false, "first_name": "Admin"},
+                "date": 1,
+                "old_chat_member": {
+                    "status": "member",
+                    "user": {"id": 2, "is_bot": false, "first_name": "Member"}
+                },
+                "new_chat_member": {
+                    "status": "kicked",
+                    "user": {"id": 2, "is_bot": false, "first_name": "Member"}
                 }
             }
-            if let Some(left_member) = message.left_chat_member {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupMemberDecreaseEvent(
-                        GroupMemberDecreaseEvent {
-                            group: parse_group(message.chat.clone()),
-                            user: parse_user(left_member),
-                            reason: oxidebot::event::notice::GroupMemberDecreaseReason::Unknown,
-                        },
-                    ),
-                ))
-            }
-        }
-        UpdateData::EditedMessage {
-            edited_message: message,
-        } => {
-            if let Some(user) = message.from.clone().and_then(|f| Some(parse_user(f))) {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::MessageEditedEvent(MessageEditedEvent {
-                        user: user,
-                        group: {
-                            if message.chat.r#type == "private" {
-                                None
-                            } else {
-                                Some(parse_group(message.chat.clone()))
-                            }
-                        },
-                        new_message: Some(parse_message(message.clone())),
-                        operator: {
-                            if let Some(user) = message.from.clone() {
-                                Some(parse_user(user))
-                            } else {
-                                None
-                            }
-                        },
-                        old_message: None,
-                    }),
-                ));
-            }
-        }
-        UpdateData::ChannelPost { channel_post } => {
-            if let Some(user) = channel_post.from.clone().and_then(|f| Some(parse_user(f))) {
-                results.push(Event::MessageEvent(MessageEvent {
-                    id: format!("{}_{}", channel_post.chat.id, channel_post.message_id),
-                    time: DateTime::from_timestamp(channel_post.date, 0),
-                    sender: user,
-                    group: {
-                        if channel_post.chat.r#type == "private" {
-                            None
-                        } else {
-                            Some(parse_group(channel_post.chat.clone()))
-                        }
-                    },
-                    message: segment::parse_message(channel_post),
-                }));
-            }
-        }
-        UpdateData::EditedChannelPost {
-            edited_channel_post,
-        } => {
-            if let Some(user) = edited_channel_post
-                .from
-                .clone()
-                .and_then(|f| Some(parse_user(f)))
-            {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::MessageEditedEvent(MessageEditedEvent {
-                        user: user,
-                        group: {
-                            if edited_channel_post.chat.r#type == "private" {
-                                None
-                            } else {
-                                Some(parse_group(edited_channel_post.chat.clone()))
-                            }
-                        },
-                        new_message: Some(parse_message(edited_channel_post.clone())),
-                        operator: {
-                            if let Some(user) = edited_channel_post.from.clone() {
-                                Some(parse_user(user))
-                            } else {
-                                None
-                            }
-                        },
-                        old_message: None,
-                    }),
-                ));
-            }
-        }
-        UpdateData::MessageReaction { message_reaction } => {
-            if let Some(user) = message_reaction
-                .user
-                .clone()
-                .and_then(|f| Some(parse_user(f)))
-            {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::MessageReactionsEvent(MessageReactionsEvent {
-                        user: user,
-                        group: {
-                            if message_reaction.chat.r#type == "private" {
-                                None
-                            } else {
-                                Some(parse_group(message_reaction.chat.clone()))
-                            }
-                        },
-                        message: {
-                            Message {
-                                id: format!(
-                                    "{}_{}",
-                                    message_reaction.chat.id, message_reaction.message_id
-                                ),
-                                segments: Vec::with_capacity(0),
-                            }
-                        },
-                        reactions: message_reaction
-                            .new_reaction
-                            .into_iter()
-                            .map(|r| parse_reaction(r))
-                            .collect(),
-                    }),
-                ));
-            }
-        }
-        UpdateData::MyChatMember { my_chat_member } => {
-            if let ChatMember::Left { .. } = my_chat_member.new_chat_member {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupMemberDecreaseEvent(
-                        GroupMemberDecreaseEvent {
-                            group: parse_group(my_chat_member.chat),
-                            user: parse_user(my_chat_member.from),
-                            reason: oxidebot::event::notice::GroupMemberDecreaseReason::Unknown,
-                        },
-                    ),
-                ))
-            } else if let ChatMember::Banned { user, until_date } = my_chat_member.new_chat_member {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupMemberMuteChangeEvent(
-                        GroupMemberMuteChangeEvent {
-                            group: parse_group(my_chat_member.chat),
-                            user: parse_user(user),
-                            operator: None,
-                            r#type: oxidebot::event::notice::MuteType::Mute {
-                                duration: Some(Duration::from_secs({
-                                    // 使用结束时间减去当前时间得到禁言时长
-                                    if let Some(until_date) = until_date {
-                                        (until_date - chrono::Local::now().timestamp()) as u64
-                                    } else {
-                                        0
-                                    }
-                                })),
-                            },
-                        },
-                    ),
-                ))
-            } else if let ChatMember::Administrator { .. } | ChatMember::Owner { .. } =
-                my_chat_member.new_chat_member
-            {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupAdminChangeEvent(GroupAdminChangeEvent {
-                        group: parse_group(my_chat_member.chat),
-                        user: parse_user(my_chat_member.from),
-                        r#type: {
-                            if let ChatMember::Administrator { .. } | ChatMember::Owner { .. } =
-                                my_chat_member.new_chat_member
-                            {
-                                GroupAdminChangeType::Set
-                            } else {
-                                GroupAdminChangeType::Unset
-                            }
-                        },
-                    }),
-                ))
-            }
-        }
-        UpdateData::ChatMember { chat_member } => {
-            if let ChatMember::Left { .. } = chat_member.new_chat_member {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupMemberDecreaseEvent(
-                        GroupMemberDecreaseEvent {
-                            group: parse_group(chat_member.chat),
-                            user: parse_user(chat_member.from),
-                            reason: oxidebot::event::notice::GroupMemberDecreaseReason::Unknown,
-                        },
-                    ),
-                ))
-            } else if let ChatMember::Banned { user, .. } = chat_member.new_chat_member {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupMemberDecreaseEvent(
-                        GroupMemberDecreaseEvent {
-                            group: parse_group(chat_member.chat),
-                            user: parse_user(user),
-                            reason: oxidebot::event::notice::GroupMemberDecreaseReason::Kick {
-                                operator: None,
-                            },
-                        },
-                    ),
-                ))
-            } else if let ChatMember::Restricted {
-                user, until_date, ..
-            } = chat_member.new_chat_member
-            {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupMemberMuteChangeEvent(
-                        GroupMemberMuteChangeEvent {
-                            group: parse_group(chat_member.chat),
-                            user: parse_user(user),
-                            operator: None,
-                            r#type: oxidebot::event::notice::MuteType::Mute {
-                                duration: Some(Duration::from_secs({
-                                    // 使用结束时间减去当前时间得到禁言时长
-                                    (until_date - chrono::Local::now().timestamp()) as u64
-                                })),
-                            },
-                        },
-                    ),
-                ))
-            } else if let ChatMember::Administrator { .. } | ChatMember::Owner { .. } =
-                chat_member.new_chat_member
-            {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupAdminChangeEvent(GroupAdminChangeEvent {
-                        group: parse_group(chat_member.chat),
-                        user: parse_user(chat_member.from),
-                        r#type: {
-                            if let ChatMember::Administrator { .. } | ChatMember::Owner { .. } =
-                                chat_member.new_chat_member
-                            {
-                                GroupAdminChangeType::Set
-                            } else {
-                                GroupAdminChangeType::Unset
-                            }
-                        },
-                    }),
-                ))
-            } else if let ChatMember::Restricted {
-                user, until_date, ..
-            } = chat_member.new_chat_member
-            {
-                results.push(Event::NoticeEvent(
-                    oxidebot::event::NoticeEvent::GroupMemberMuteChangeEvent(
-                        GroupMemberMuteChangeEvent {
-                            group: parse_group(chat_member.chat),
-                            user: parse_user(user),
-                            operator: None,
-                            r#type: oxidebot::event::notice::MuteType::Mute {
-                                duration: Some(Duration::from_secs({
-                                    // 使用结束时间减去当前时间得到禁言时长
-                                    (until_date - chrono::Local::now().timestamp()) as u64
-                                })),
-                            },
-                        },
-                    ),
-                ))
-            }
-        }
-        UpdateData::ChatJoinRequest { chat_join_request } => results.push({
-            Event::RequestEvent(oxidebot::event::RequestEvent::GroupAddEvent(
-                GroupAddEvent {
-                    id: chat_join_request.user_chat_id.to_string(),
-                    user: parse_user(chat_join_request.from),
-                    group: parse_group(chat_join_request.chat),
-                    message: chat_join_request.bio,
-                },
-            ))
-        }),
-        UpdateData::ChatBoost { chat_boost } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "ChatBoost".to_string(),
-            data: Box::new(ChatBoostEventWrapper(chat_boost)),
-        })),
-        UpdateData::RemovedChatBoost { removed_chat_boost } => {
-            results.push(Event::AnyEvent(AnyEvent {
-                server: SERVER,
-                r#type: "RemovedChatBoost".to_string(),
-                data: Box::new(RemovedChatBoostEventWrapper(removed_chat_boost)),
-            }))
-        }
-        UpdateData::MessageReactionCount {
-            message_reaction_count,
-        } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "MessageReactionCount".to_string(),
-            data: Box::new(MessageReactionCountEventWrapper(message_reaction_count)),
-        })),
-        UpdateData::InlineQuery { inline_query } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "InlineQuery".to_string(),
-            data: Box::new(InlineQueryEventWrapper(inline_query)),
-        })),
-        UpdateData::ChosenInlineResult {
-            chosen_inline_result,
-        } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "ChosenInlineResult".to_string(),
-            data: Box::new(ChosenInlineResultEventWrapper(chosen_inline_result)),
-        })),
-        UpdateData::CallbackQuery { callback_query } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "CallbackQuery".to_string(),
-            data: Box::new(CallbackQueryEventWrapper(callback_query)),
-        })),
-        UpdateData::ShippingQuery { shipping_query } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "ShippingQuery".to_string(),
-            data: Box::new(ShippingQueryEventWrapper(shipping_query)),
-        })),
-        UpdateData::PreCheckoutQuery { pre_checkout_query } => {
-            results.push(Event::AnyEvent(AnyEvent {
-                server: SERVER,
-                r#type: "PreCheckoutQuery".to_string(),
-                data: Box::new(PreCheckoutQueryEventWrapper(pre_checkout_query)),
-            }))
-        }
-        UpdateData::Poll { poll } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "Poll".to_string(),
-            data: Box::new(PollEventWrapper(poll)),
-        })),
-        UpdateData::PollAnswer { poll_answer } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "PollAnswer".to_string(),
-            data: Box::new(PollAnswerEventWrapper(poll_answer)),
-        })),
-        UpdateData::DeletedBusinessMessages {
-            deleted_business_messages,
-        } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "DeletedBusinessMessages".to_string(),
-            data: Box::new(DeletedBusinessMessagesEventWrapper(
-                deleted_business_messages,
-            )),
-        })),
-        UpdateData::EditedBusinessMessage {
-            edited_business_message,
-        } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "EditedBusinessMessage".to_string(),
-            data: Box::new(EditedBusinessMessageEventWrapper(edited_business_message)),
-        })),
-        UpdateData::BusinessConnection {
-            business_connection,
-        } => results.push(Event::AnyEvent(AnyEvent {
-            server: SERVER,
-            r#type: "BusinessConnection".to_string(),
-            data: Box::new(BussinessConnectionEventWrapper(business_connection)),
-        })),
-        UpdateData::BusinessMessage { business_message } => {
-            results.push(Event::AnyEvent(AnyEvent {
-                server: SERVER,
-                r#type: "BusinessMessage".to_string(),
-                data: Box::new(EditedBusinessMessageEventWrapper(business_message)),
-            }))
-        }
+        }));
+        let events = parse_update(&update);
+        let Event::NoticeEvent(NoticeEvent::GroupMemberDecreaseEvent(event)) = &events[0] else {
+            panic!("expected decrease event")
+        };
+        assert_eq!(event.user.id, "2");
+        let GroupMemberDecreaseReason::Kick { operator } = &event.reason else {
+            panic!("expected kick reason")
+        };
+        assert_eq!(operator.as_ref().unwrap().id, "1");
     }
 
-    results
+    #[test]
+    fn expired_mute_duration_never_wraps_to_u64_max() {
+        assert_eq!(remaining_duration(Some(1)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn join_request_id_contains_chat_and_user() {
+        let update = update(serde_json::json!({
+            "update_id": 4,
+            "chat_join_request": {
+                "chat": {"id": -100, "type": "supergroup", "title": "Group"},
+                "from": {"id": 2, "is_bot": false, "first_name": "User"},
+                "user_chat_id": 2,
+                "date": 1
+            }
+        }));
+        let events = parse_update(&update);
+        let Event::RequestEvent(RequestEvent::GroupAddEvent(event)) = &events[0] else {
+            panic!("expected join request")
+        };
+        assert_eq!(event.id, "-100:2");
+    }
+
+    #[test]
+    fn known_update_with_no_common_semantic_mapping_is_not_dropped() {
+        let update = update(serde_json::json!({
+            "update_id": 6,
+            "chat_member": {
+                "chat": {"id": -100, "type": "supergroup", "title": "Group"},
+                "from": {"id": 1, "is_bot": false, "first_name": "Admin"},
+                "date": 1,
+                "old_chat_member": {
+                    "status": "administrator",
+                    "user": {"id": 2, "is_bot": false, "first_name": "Member"},
+                    "can_delete_messages": false
+                },
+                "new_chat_member": {
+                    "status": "administrator",
+                    "user": {"id": 2, "is_bot": false, "first_name": "Member"},
+                    "can_delete_messages": true
+                }
+            }
+        }));
+
+        let events = parse_update(&update);
+        let Event::AnyEvent(event) = &events[0] else {
+            panic!("expected a raw fallback event")
+        };
+        assert_eq!(event.r#type, "chat_member");
+    }
+
+    #[test]
+    fn administrator_title_change_maps_to_alias_event() {
+        let update = update(serde_json::json!({
+            "update_id": 7,
+            "chat_member": {
+                "chat": {"id": -100, "type": "supergroup", "title": "Group"},
+                "from": {"id": 1, "is_bot": false, "first_name": "Admin"},
+                "date": 1,
+                "old_chat_member": {
+                    "status": "administrator",
+                    "user": {"id": 2, "is_bot": false, "first_name": "Member"},
+                    "custom_title": "old"
+                },
+                "new_chat_member": {
+                    "status": "administrator",
+                    "user": {"id": 2, "is_bot": false, "first_name": "Member"},
+                    "custom_title": "new"
+                }
+            }
+        }));
+
+        let events = parse_update(&update);
+        let Event::NoticeEvent(NoticeEvent::GroupMemberAliasChangeEvent(event)) = &events[0] else {
+            panic!("expected an alias change event")
+        };
+        assert_eq!(event.old_alias.as_deref(), Some("old"));
+        assert_eq!(event.new_alias.as_deref(), Some("new"));
+    }
 }
