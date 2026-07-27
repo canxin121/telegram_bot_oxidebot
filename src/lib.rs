@@ -6,6 +6,7 @@ pub mod event;
 pub mod methods;
 pub mod segment;
 pub mod telegram;
+mod tls;
 pub mod utils;
 
 pub use bot::TelegramBot;

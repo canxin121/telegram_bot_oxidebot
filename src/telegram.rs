@@ -53,7 +53,8 @@ impl TelegramClient {
         );
 
         let api_base = api_base.into().trim_end_matches('/').to_owned();
-        let client = reqwest::Client::builder()
+        let client = crate::tls::webpki_client_builder()
+            .context("failed to load WebPKI root certificates")?
             .connect_timeout(Duration::from_secs(15))
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),

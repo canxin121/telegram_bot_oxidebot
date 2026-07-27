@@ -785,6 +785,8 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "oxidebot"
 version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d747187b5fe9f1eb9965a74e13c171a694061fc2c6d70508c1b342775b97d6dd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1351,6 +1353,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "webpki-root-certs",
 ]
 
 [[package]]

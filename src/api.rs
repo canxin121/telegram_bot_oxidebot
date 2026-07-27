@@ -6353,7 +6353,12 @@ async fn avatar_upload(uri: &Uri) -> Result<Upload> {
         .to_owned();
     let bytes = match uri.scheme_str() {
         Some("http" | "https") => {
-            let response = reqwest::get(uri.to_string())
+            let response = crate::tls::webpki_client_builder()
+                .context("failed to load WebPKI root certificates")?
+                .build()
+                .context("failed to create avatar download client")?
+                .get(uri.to_string())
+                .send()
                 .await
                 .context("failed to download group avatar")?
                 .error_for_status()
